@@ -90,17 +90,21 @@ class PVFPFramework:
             self.domains[0]
         )
         state_dim = sample_env.get_state_dim()
-        action_dim = len(self.domains[0])  # 每个域的节点数作为动作空间
+        # 所有域使用统一的动作空间维度（所有域节点数的最大值），以支持联邦聚合
+        max_action_dim = max(len(nodes) for nodes in self.domains.values())
         
         for domain_id in range(num_domains):
+            domain_nodes = self.domains[domain_id]
             agent = DQNAgent(
                 domain_id=domain_id,
                 state_dim=state_dim,
-                action_dim=len(self.domains[domain_id]),
+                action_dim=max_action_dim,
                 buffer_capacity=REPLAY_BUFFER_SIZE
             )
+            # 记录该域真实可用的动作数量（域内节点数）
+            agent.valid_action_dim = len(domain_nodes)
             self.domain_agents.append(agent)
-            print(f"  域 {domain_id}: 状态维度={state_dim}, 动作维度={len(self.domains[domain_id])}")
+            print(f"  域 {domain_id}: 状态维度={state_dim}, 动作维度={len(domain_nodes)}")
         
         # 训练统计
         self.training_history = {
@@ -117,6 +121,9 @@ class PVFPFramework:
             f.write("PVFP 联邦训练日志\n")
             f.write(f"scale={self.scale}, num_domains={self.num_domains}\n")
             f.write("="*60 + "\n\n")
+
+        # 在训练开始前记录当前拓扑和域划分概要
+        self._log_topology_summary()
 
         print(f"\n{'='*70}")
         print(f"PVFP框架初始化完成!")
@@ -176,8 +183,12 @@ class PVFPFramework:
                 done = False
                 
                 while not done:
-                    # 选择动作
-                    action = agent.select_action(state, training=True)
+                    # 选择动作（仅在本域有效动作范围内）
+                    action = agent.select_action(
+                        state,
+                        training=True,
+                        valid_action_dim=len(domain_nodes)
+                    )
                     
                     # 执行动作
                     next_state, reward, done, info = env.step(action)
@@ -234,6 +245,24 @@ class PVFPFramework:
             with open(self.log_file, 'a', encoding='utf-8') as f:
                 f.write(text + "\n")
         except Exception:
+            pass
+    
+    def _log_topology_summary(self):
+        """在日志中记录当前拓扑和域划分概要"""
+        if self.topology is None or not hasattr(self, 'log_file'):
+            return
+        try:
+            num_nodes = self.topology.number_of_nodes()
+            num_links = self.topology.number_of_edges()
+            self._append_log(
+                f"[拓扑] scale={self.scale}, 节点数={num_nodes}, 链路数={num_links}"
+            )
+            for domain_id, nodes in self.domains.items():
+                self._append_log(
+                    f"[拓扑] 域 {domain_id}: {len(nodes)} 个节点 {nodes}"
+                )
+        except Exception:
+            # 拓扑日志失败不影响训练
             pass
     
     def run_federated_training(self, num_sfcs=10, aggregation_rounds=AGGREGATION_EPOCHS):
@@ -383,8 +412,21 @@ class PVFPFramework:
         total_latency = 0
         total_resource = 0
         success_count = 0
+        per_sfc_results = []
         
         for sfc in test_sfcs:
+            # 初始化当前SFC的评估结果容器
+            sfc_result = {
+                'sfc_id': sfc.get('id'),
+                'source': sfc.get('source'),
+                'destination': sfc.get('destination'),
+                'vnf_sequence': sfc.get('vnf_sequence', []),
+                'success': False,
+                'assigned_domain': None,
+                'metrics': None,
+                'vnf_placements': None,
+            }
+
             # 为每个域创建环境并部署
             for domain_id in range(self.num_domains):
                 domain_nodes = self.domains[domain_id]
@@ -401,17 +443,31 @@ class PVFPFramework:
                 agent = self.domain_agents[domain_id]
                 
                 while not done:
-                    action = agent.select_action(state, training=False)
+                    action = agent.select_action(
+                        state,
+                        training=False,
+                        valid_action_dim=len(domain_nodes)
+                    )
                     next_state, reward, done, info = env.step(action)
                     state = next_state
                 
                 metrics = env.get_metrics()
+
+                # 记录该SFC在第一个成功部署域上的详细结果
                 if metrics['deployment_rate'] == 1.0:
                     total_latency += metrics['total_latency']
                     total_resource += metrics['total_resource_cost']
                     success_count += 1
+
+                    sfc_result['success'] = True
+                    sfc_result['assigned_domain'] = domain_id
+                    sfc_result['metrics'] = metrics
+                    # 复制一份部署映射，避免后续环境复用导致的副作用
+                    sfc_result['vnf_placements'] = dict(env.vnf_placements)
                     break
-        
+
+            per_sfc_results.append(sfc_result)
+
         avg_latency = total_latency / success_count if success_count > 0 else 0
         avg_resource = total_resource / success_count if success_count > 0 else 0
         success_rate = success_count / num_sfcs
@@ -421,7 +477,8 @@ class PVFPFramework:
             'success_count': success_count,
             'success_rate': success_rate,
             'avg_latency': avg_latency,
-            'avg_resource': avg_resource
+            'avg_resource': avg_resource,
+            'per_sfc_results': per_sfc_results,
         }
         
         print(f"\n评估结果:")
@@ -432,6 +489,49 @@ class PVFPFramework:
         print(f"{'='*70}\n")
         
         return results
+    
+    def save_model(self, model_name=None):
+        """保存当前全局模型权重到文件"""
+        os.makedirs(MODEL_SAVE_PATH, exist_ok=True)
+        model_dir = os.path.join(MODEL_SAVE_PATH, self.scale)
+        os.makedirs(model_dir, exist_ok=True)
+
+        if model_name is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            model_name = f"pvfp_model_{self.scale}_{timestamp}.npz"
+
+        model_path = os.path.join(model_dir, model_name)
+
+        # 优先使用聚合器中的全局权重
+        global_weights = self.aggregator.get_global_weights()
+        if global_weights is None:
+            # 如果还没有进行联邦聚合，则从任意一个域代理获取当前权重
+            if self.domain_agents:
+                global_weights = self.domain_agents[0].get_weights()
+            else:
+                print("[警告] 没有可保存的模型权重")
+                return model_path
+
+        np.savez(model_path, *global_weights)
+        print(f"[模型保存] {model_path}")
+        return model_path
+
+    def load_model(self, model_path):
+        """从文件加载全局模型权重并下发到各域代理"""
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"模型文件不存在: {model_path}")
+
+        data = np.load(model_path, allow_pickle=True)
+        # np.savez 默认使用 arr_0, arr_1, ... 作为键
+        global_weights = [data[key] for key in sorted(data.files)]
+
+        # 设置聚合器的全局权重，并同步到所有域代理
+        self.aggregator.set_global_weights(global_weights)
+        for agent in self.domain_agents:
+            agent.set_weights(global_weights)
+
+        print(f"[模型加载] {model_path}")
+        return global_weights
     
     def save_results(self):
         """保存训练结果"""

@@ -51,7 +51,10 @@ class VNFPlacementEnv:
         
         # 统计信息
         self.total_latency = 0.0
+        # 资源开销：CPU利用率和带宽利用率
         self.total_resource_cost = 0.0
+        self.cpu_resource_cost = 0.0
+        self.bw_resource_cost = 0.0
     
     def get_state_dim(self):
         """
@@ -127,6 +130,8 @@ class VNFPlacementEnv:
         self.deployed_vnfs = set()
         self.total_latency = 0.0
         self.total_resource_cost = 0.0
+        self.cpu_resource_cost = 0.0
+        self.bw_resource_cost = 0.0
         
         return self.get_state()
     
@@ -170,7 +175,14 @@ class VNFPlacementEnv:
         # 计算延迟和资源开销
         latency_increment = self._calculate_latency_increment(self.current_vnf_idx, selected_node)
         self.total_latency += latency_increment
-        self.total_resource_cost += self.cpu_req_per_vnf
+
+        # CPU资源开销：本次部署VNF在所选节点上的CPU占比
+        cpu_capacity = self.topology.nodes[selected_node]['cpu_capacity']
+        if cpu_capacity > 0:
+            self.cpu_resource_cost += self.cpu_req_per_vnf / cpu_capacity
+
+        # 汇总资源开销（CPU + 带宽）
+        self.total_resource_cost = self.cpu_resource_cost + self.bw_resource_cost
         
         # 移动到下一个VNF
         self.current_vnf_idx += 1
@@ -234,7 +246,12 @@ class VNFPlacementEnv:
                     for i in range(len(path) - 1):
                         edge = (path[i], path[i+1])
                         if self.topology.has_edge(*edge):
+                            # 链路时延
                             path_delay += self.topology.edges[edge]['delay']
+                            # 带宽资源开销：本SFC在该链路上的带宽占比
+                            bw_capacity = self.topology.edges[edge]['bandwidth']
+                            if bw_capacity > 0:
+                                self.bw_resource_cost += self.bandwidth_req / bw_capacity
                     
                     # 传输延迟
                     transmission_delay = BASE_TRANSMISSION_DELAY
@@ -269,6 +286,8 @@ class VNFPlacementEnv:
             'total_latency': self.total_latency,
             'avg_latency_per_vnf': self.total_latency / self.num_vnfs if self.num_vnfs > 0 else 0,
             'total_resource_cost': self.total_resource_cost,
+            'cpu_resource_cost': self.cpu_resource_cost,
+            'bw_resource_cost': self.bw_resource_cost,
             'num_vnfs_deployed': len(self.deployed_vnfs),
             'deployment_rate': len(self.deployed_vnfs) / self.num_vnfs if self.num_vnfs > 0 else 0
         }

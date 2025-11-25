@@ -232,28 +232,38 @@ class DQNAgent:
         """软更新目标网络"""
         self.sess.run(self.update_target_ops)
     
-    def select_action(self, state, training=True):
-        """
-        使用ε-greedy策略选择动作
+    def select_action(self, state, training=True, valid_action_dim=None):
+        """使用ε-greedy策略选择动作
         
         Args:
             state: 当前状态
             training: 是否在训练模式
+            valid_action_dim: 当前环境中实际可用的动作数量（例如域内节点数）。
+                              如果为None，则使用agent自身记录的valid_action_dim，
+                              若仍不存在则退回到self.action_dim。
         
         Returns:
             选择的动作
         """
+        # 确定当前有效的动作数
+        if valid_action_dim is None:
+            valid_action_dim = getattr(self, 'valid_action_dim', self.action_dim)
+        valid_action_dim = int(valid_action_dim)
+        if valid_action_dim <= 0:
+            valid_action_dim = self.action_dim
+
         if training and np.random.rand() < self.epsilon:
-            # 探索：随机选择动作
-            return np.random.randint(0, self.action_dim)
+            # 探索：在有效动作范围内随机选择动作
+            return np.random.randint(0, valid_action_dim)
         else:
-            # 利用：选择Q值最大的动作
+            # 利用：在有效动作范围内选择Q值最大的动作
             state_vec = self._normalize_state(state).reshape(1, -1)
             q_values = self.sess.run(
                 self.predict_net.q_values,
                 feed_dict={self.predict_net.state_input: state_vec}
             )
-            return np.argmax(q_values[0])
+            # 只在前valid_action_dim个动作上取最大值
+            return int(np.argmax(q_values[0][:valid_action_dim]))
     
     def store_transition(self, state, action, reward, next_state, done):
         """存储转移到经验回放缓冲区"""
@@ -299,8 +309,14 @@ class DQNAgent:
             self.target_net.q_values,
             feed_dict={self.target_net.state_input: next_states}
         )
-        
-        max_next_q = np.max(next_q_values, axis=1)
+
+        # 只在当前域实际可用的动作范围内计算max Q(s', a')
+        valid_action_dim = getattr(self, 'valid_action_dim', self.action_dim)
+        valid_action_dim = int(valid_action_dim)
+        if valid_action_dim <= 0 or valid_action_dim > self.action_dim:
+            valid_action_dim = self.action_dim
+
+        max_next_q = np.max(next_q_values[:, :valid_action_dim], axis=1)
         target_q = rewards + GAMMA * max_next_q * (1 - dones)
         
         # 训练预测网络
@@ -365,7 +381,7 @@ class DQNAgent:
     def load_model(self, path):
         """加载模型"""
         saver = tf.train.Saver()
-        saver.load(self.sess, path)
+        saver.restore(self.sess, path)
     
     def close(self):
         """关闭会话"""

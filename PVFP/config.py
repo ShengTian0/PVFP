@@ -60,7 +60,8 @@ EPSILON_DECAY = 0.995
 USE_ADAPTIVE_EPSILON = True  # 使用基于奖励的自适应ε
 
 # ==================== 联邦学习配置 ====================
-NUM_DOMAINS = 4  # 域的数量
+# 论文中默认将网络划分为3个联邦域
+NUM_DOMAINS = 3  # 域的数量
 AGGREGATION_EPOCHS = 100  # 全局聚合轮数
 LOCAL_EPOCHS = 10  # 每个域的本地训练轮数
 

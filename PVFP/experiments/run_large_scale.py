@@ -19,7 +19,7 @@ def run_large_scale_experiment():
     print("="*80)
     print("\n配置:")
     print("  - 网络规模: 35节点, 79链路")
-    print("  - 域数量: 6")
+    print("  - 域数量: 3")
     print("  - CPU容量: 20核/节点")
     print("  - 带宽: 2 Mbps/链路")
     print("  - SFC数量: 25")
@@ -28,7 +28,7 @@ def run_large_scale_experiment():
     
     # 创建PVFP框架
     start_time = time.time()
-    pvfp = PVFPFramework(scale='large', num_domains=6)
+    pvfp = PVFPFramework(scale='large', num_domains=3)
     
     # 执行训练
     training_results = pvfp.run_federated_training(

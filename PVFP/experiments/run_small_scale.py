@@ -19,7 +19,7 @@ def run_small_scale_experiment():
     print("="*80)
     print("\n配置:")
     print("  - 网络规模: 12节点, 15链路")
-    print("  - 域数量: 4")
+    print("  - 域数量: 3")
     print("  - CPU容量: 30核/节点")
     print("  - 带宽: 4 Mbps/链路")
     print("  - SFC数量: 15")
@@ -28,13 +28,16 @@ def run_small_scale_experiment():
     
     # 创建PVFP框架
     start_time = time.time()
-    pvfp = PVFPFramework(scale='small', num_domains=4)
+    pvfp = PVFPFramework(scale='small', num_domains=3)
     
     # 执行训练
     training_results = pvfp.run_federated_training(
         num_sfcs=15,
         aggregation_rounds=30
     )
+    
+    # 保存训练好的模型
+    model_path = pvfp.save_model()
     
     # 评估
     evaluation_results = pvfp.evaluate(num_sfcs=30)
@@ -48,7 +51,7 @@ def run_small_scale_experiment():
     print(f"实验总用时: {total_time/60:.2f} 分钟")
     print("="*80 + "\n")
     
-    return training_results, evaluation_results
+    return training_results, evaluation_results, model_path
 
 
 if __name__ == "__main__":
