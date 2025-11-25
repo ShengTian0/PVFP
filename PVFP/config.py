@@ -85,6 +85,13 @@ SAVE_INTERVAL = 50
 MODEL_SAVE_PATH = './logs/models/'
 RESULT_SAVE_PATH = './logs/results/'
 
+# ==================== 网络模型配置 ====================
+FUNCTION_NODE_RATIO = 0.4
+MAX_DEPLOYMENT_COST = 20
+MAX_LINK_COST = 10
+MIN_DEPLOY_BUDGET = 40
+MAX_DEPLOY_BUDGET = 80
+
 # ==================== GPU配置 ====================
 USE_GPU = True
 GPU_MEMORY_FRACTION = 0.8

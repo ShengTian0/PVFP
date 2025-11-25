@@ -55,6 +55,17 @@ class VNFPlacementEnv:
         self.total_resource_cost = 0.0
         self.cpu_resource_cost = 0.0
         self.bw_resource_cost = 0.0
+
+        # 部署成本预算（单个SFC内部使用，不在SFC之间累计）
+        self.node_budget_available = {}
+        for node in self.domain_nodes:
+            node_data = self.topology.nodes[node]
+            budget_cap = node_data.get('deploy_budget_capacity', float('inf'))
+            self.node_budget_available[node] = budget_cap
+
+        # 记录VNF间通信路径及其链路成本，便于评估时输出
+        self.used_paths = []          # 每次VNF间通信的节点序列
+        self.path_link_costs = []     # 对应路径上的链路成本
     
     def get_state_dim(self):
         """
@@ -132,6 +143,17 @@ class VNFPlacementEnv:
         self.total_resource_cost = 0.0
         self.cpu_resource_cost = 0.0
         self.bw_resource_cost = 0.0
+
+        # 重置本SFC内部的节点部署预算
+        self.node_budget_available = {}
+        for node in self.domain_nodes:
+            node_data = self.topology.nodes[node]
+            budget_cap = node_data.get('deploy_budget_capacity', float('inf'))
+            self.node_budget_available[node] = budget_cap
+
+        # 重置路径记录
+        self.used_paths = []
+        self.path_link_costs = []
         
         return self.get_state()
     
@@ -154,8 +176,27 @@ class VNFPlacementEnv:
             return self.get_state(), -100, True, {'error': 'invalid_action'}
         
         selected_node = self.domain_nodes[action]
-        
-        # 检查资源是否充足
+
+        # 当前VNF类型
+        if self.current_vnf_idx < self.num_vnfs:
+            current_vnf_type = self.vnf_sequence[self.current_vnf_idx]
+        else:
+            current_vnf_type = None
+
+        # 节点部署预算检查：本次部署的成本不能超过节点剩余预算
+        if current_vnf_type is not None:
+            node_data = self.topology.nodes[selected_node]
+            deploy_costs = node_data.get('deployment_costs', {})
+            deploy_cost = deploy_costs.get(current_vnf_type, 0.0)
+            budget_avail = self.node_budget_available.get(selected_node, float('inf'))
+            if budget_avail < deploy_cost:
+                # 部署预算不足，给予惩罚
+                return self.get_state(), -50, True, {'error': 'insufficient_deploy_budget'}
+        else:
+            deploy_cost = 0.0
+            budget_avail = self.node_budget_available.get(selected_node, float('inf'))
+
+        # 检查CPU资源是否充足
         node_cpu_available = self.topology.nodes[selected_node]['cpu_available']
         if node_cpu_available < self.cpu_req_per_vnf:
             # 资源不足，给予惩罚
@@ -172,17 +213,23 @@ class VNFPlacementEnv:
             (self.sfc_request['id'], self.current_vnf_idx)
         )
         
-        # 计算延迟和资源开销
+        # 记录本步之前的总成本
+        prev_total_cost = self.total_resource_cost
+
+        # 计算延迟和成本
         latency_increment = self._calculate_latency_increment(self.current_vnf_idx, selected_node)
         self.total_latency += latency_increment
 
-        # CPU资源开销：本次部署VNF在所选节点上的CPU占比
-        cpu_capacity = self.topology.nodes[selected_node]['cpu_capacity']
-        if cpu_capacity > 0:
-            self.cpu_resource_cost += self.cpu_req_per_vnf / cpu_capacity
+        # 部署成本：当前VNF在所选功能节点上的实例化成本，并从节点预算中扣减
+        if current_vnf_type is not None:
+            self.cpu_resource_cost += deploy_cost
+            self.node_budget_available[selected_node] = budget_avail - deploy_cost
 
-        # 汇总资源开销（CPU + 带宽）
+        # 汇总总成本（部署成本 + 链路成本）
         self.total_resource_cost = self.cpu_resource_cost + self.bw_resource_cost
+
+        # 本步新增成本
+        step_cost = self.total_resource_cost - prev_total_cost
         
         # 移动到下一个VNF
         self.current_vnf_idx += 1
@@ -190,22 +237,17 @@ class VNFPlacementEnv:
         # 检查是否完成
         done = self.current_vnf_idx >= self.num_vnfs
         
-        # 计算奖励（负延迟，越小越好）
-        reward = -latency_increment
-        
-        # 如果完成，给予额外奖励/惩罚
-        if done:
-            # 成功完成所有VNF部署
-            reward += 10
-            # 考虑总延迟的惩罚
-            reward -= self.total_latency * 0.1
+        # 奖励：以“最小化成本”为目标，使用本步新增成本的负值
+        reward = -step_cost
         
         next_state = self.get_state()
         info = {
             'latency': latency_increment,
             'total_latency': self.total_latency,
             'vnf_placed': self.current_vnf_idx - 1,
-            'node_selected': selected_node
+            'node_selected': selected_node,
+            'step_cost': step_cost,
+            'total_cost': self.total_resource_cost
         }
         
         return next_state, reward, done, info
@@ -243,15 +285,18 @@ class VNFPlacementEnv:
                 try:
                     path = nx.shortest_path(self.topology, prev_node, node)
                     path_delay = 0
+                    path_cost = 0.0
                     for i in range(len(path) - 1):
                         edge = (path[i], path[i+1])
                         if self.topology.has_edge(*edge):
+                            edge_data = self.topology.edges[edge]
                             # 链路时延
-                            path_delay += self.topology.edges[edge]['delay']
-                            # 带宽资源开销：本SFC在该链路上的带宽占比
-                            bw_capacity = self.topology.edges[edge]['bandwidth']
-                            if bw_capacity > 0:
-                                self.bw_resource_cost += self.bandwidth_req / bw_capacity
+                            path_delay += edge_data['delay']
+                            # 链路成本：ce * b
+                            link_cost = edge_data.get('cost', 1)
+                            edge_cost = link_cost * self.bandwidth_req
+                            self.bw_resource_cost += edge_cost
+                            path_cost += edge_cost
                     
                     # 传输延迟
                     transmission_delay = BASE_TRANSMISSION_DELAY
@@ -259,6 +304,10 @@ class VNFPlacementEnv:
                     transfer_time = data_size * 8 * READ_WRITE_PER_BIT / 1000  # ms
                     
                     latency += path_delay + transmission_delay + transfer_time
+
+                    # 记录该次VNF间通信路径及其链路成本
+                    self.used_paths.append(path)
+                    self.path_link_costs.append(path_cost)
                 except nx.NetworkXNoPath:
                     # 无路径，给予高惩罚
                     latency += 1000
@@ -289,7 +338,9 @@ class VNFPlacementEnv:
             'cpu_resource_cost': self.cpu_resource_cost,
             'bw_resource_cost': self.bw_resource_cost,
             'num_vnfs_deployed': len(self.deployed_vnfs),
-            'deployment_rate': len(self.deployed_vnfs) / self.num_vnfs if self.num_vnfs > 0 else 0
+            'deployment_rate': len(self.deployed_vnfs) / self.num_vnfs if self.num_vnfs > 0 else 0,
+            'paths': list(self.used_paths),
+            'path_link_costs': list(self.path_link_costs),
         }
         
         return metrics

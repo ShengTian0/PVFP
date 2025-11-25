@@ -53,39 +53,49 @@ class TopologyLoader:
         p = (2 * num_links) / (num_nodes * (num_nodes - 1))
         p = min(p, 1.0)
         
-        # 生成图直到获得所需的链路数
+        # 生成图直到获得所需的链路数，且保持连通性
         attempts = 0
         max_attempts = 100
         
         while attempts < max_attempts:
             G = nx.erdos_renyi_graph(num_nodes, p, seed=self.seed + attempts)
             
-            # 确保图是连通的
-            if nx.is_connected(G):
-                # 调整链路数
-                current_links = G.number_of_edges()
-                
-                if current_links >= num_links:
-                    # 删除多余的边
-                    edges_to_remove = list(G.edges())
-                    random.shuffle(edges_to_remove)
-                    for edge in edges_to_remove[:current_links - num_links]:
-                        G.remove_edge(*edge)
-                    break
-                elif current_links < num_links:
-                    # 添加边直到达到目标
-                    all_possible_edges = [(i, j) for i in range(num_nodes) 
-                                         for j in range(i+1, num_nodes)]
-                    existing_edges = set(G.edges())
-                    possible_new_edges = [e for e in all_possible_edges 
-                                         if e not in existing_edges]
-                    random.shuffle(possible_new_edges)
-                    
-                    edges_to_add = min(num_links - current_links, 
-                                      len(possible_new_edges))
-                    for edge in possible_new_edges[:edges_to_add]:
+            # 要求基础图首先是连通的
+            if not nx.is_connected(G):
+                attempts += 1
+                continue
+
+            # 调整链路数
+            current_links = G.number_of_edges()
+            
+            if current_links > num_links:
+                # 删除多余的边，但尽量避免破坏连通性
+                edges = list(G.edges())
+                random.shuffle(edges)
+                for edge in edges:
+                    if G.number_of_edges() <= num_links:
+                        break
+                    G.remove_edge(*edge)
+                    if not nx.is_connected(G):
+                        # 删除该边会导致图不连通，撤销删除
                         G.add_edge(*edge)
-                    break
+            elif current_links < num_links:
+                # 添加边直到达到目标
+                all_possible_edges = [(i, j) for i in range(num_nodes) 
+                                     for j in range(i+1, num_nodes)]
+                existing_edges = set(G.edges())
+                possible_new_edges = [e for e in all_possible_edges 
+                                     if e not in existing_edges]
+                random.shuffle(possible_new_edges)
+                
+                for edge in possible_new_edges:
+                    if G.number_of_edges() >= num_links:
+                        break
+                    G.add_edge(*edge)
+            
+            # 若当前图既连通又达到目标链路数，则结束
+            if nx.is_connected(G) and G.number_of_edges() == num_links:
+                break
             
             attempts += 1
         
@@ -107,6 +117,8 @@ class TopologyLoader:
             G.edges[edge]['bandwidth_available'] = bandwidth
             # 随机延迟 (ms)
             G.edges[edge]['delay'] = random.uniform(1, 5)
+            # 传输成本（单位带宽的成本）
+            G.edges[edge]['cost'] = random.randint(1, MAX_LINK_COST)
         
         self.topology = G
         

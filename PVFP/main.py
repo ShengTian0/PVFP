@@ -9,6 +9,7 @@ import sys
 import numpy as np
 import time
 import json
+import random
 from datetime import datetime
 
 # 添加路径
@@ -52,14 +53,17 @@ class PVFPFramework:
         # 2. 划分域
         print("\n[步骤 2] 划分网络域...")
         self.domains = self.topo_loader.partition_domains(num_domains)
+
+        # 2.1 在每个域中选取可部署VNF的功能节点，并为其生成部署成本
+        self._init_function_nodes()
         
         # 3. 初始化并行规则
         print("\n[步骤 3] 初始化VNF并行规则...")
         self.parallel_rules = VNFParallelRules()
         
-        # 4. 初始化SFC分解器
+        # 4. 初始化SFC分解器（基于功能节点域进行分解）
         print("\n[步骤 4] 初始化SFC分解器...")
-        self.decomposer = SFCDecomposer(self.topology, self.domains)
+        self.decomposer = SFCDecomposer(self.topology, self.function_domains)
         
         # 5. 初始化SFC生成器
         print("\n[步骤 5] 初始化SFC生成器...")
@@ -83,18 +87,19 @@ class PVFPFramework:
         
         # 计算状态和动作空间维度
         sample_sfc = self.sfc_generator.generate_sfc(0)
+        sample_domain_nodes = self.function_domains.get(0, self.domains[0])
         sample_env = VNFPlacementEnv(
             self.topology, 
             sample_sfc, 
             self.parallel_rules,
-            self.domains[0]
+            sample_domain_nodes
         )
         state_dim = sample_env.get_state_dim()
-        # 所有域使用统一的动作空间维度（所有域节点数的最大值），以支持联邦聚合
-        max_action_dim = max(len(nodes) for nodes in self.domains.values())
+        # 所有域使用统一的动作空间维度（所有域功能节点数的最大值），以支持联邦聚合
+        max_action_dim = max(len(nodes) for nodes in self.function_domains.values())
         
         for domain_id in range(num_domains):
-            domain_nodes = self.domains[domain_id]
+            domain_nodes = self.function_domains.get(domain_id, self.domains[domain_id])
             agent = DQNAgent(
                 domain_id=domain_id,
                 state_dim=state_dim,
@@ -125,6 +130,13 @@ class PVFPFramework:
         # 在训练开始前记录当前拓扑和域划分概要
         self._log_topology_summary()
 
+        # 在控制台打印拓扑和NFV模型的详细信息
+        self._print_topology_console()
+
+        # 说明训练中reward和loss的定义
+        print("\n[说明] Reward定义: 每一步 reward = -(本步新增部署成本 + 链路成本)，即以最小化总成本为目标。")
+        print("[说明] Loss定义: DQN的TD误差均方，即 (Q(s,a) - (r + γ max_a' Q_target(s',a')))^2 的平均值。")
+
         print(f"\n{'='*70}")
         print(f"PVFP框架初始化完成!")
         print(f"{'='*70}\n")
@@ -142,7 +154,8 @@ class PVFPFramework:
             training_stats: 训练统计信息
         """
         agent = self.domain_agents[domain_id]
-        domain_nodes = self.domains[domain_id]
+        # 只在功能节点上部署VNF
+        domain_nodes = self.function_domains.get(domain_id, self.domains[domain_id])
         
         epoch_losses = []
         epoch_rewards = []
@@ -247,6 +260,42 @@ class PVFPFramework:
         except Exception:
             pass
     
+    def _init_function_nodes(self):
+        """在每个域内选取功能节点，并为其生成部署成本矩阵"""
+        self.function_nodes = set()
+        self.function_domains = {}
+
+        for domain_id, nodes in self.domains.items():
+            num_nodes = len(nodes)
+            if num_nodes == 0:
+                self.function_domains[domain_id] = []
+                continue
+
+            # 按比例选取功能节点，至少1个
+            num_func = max(1, int(round(FUNCTION_NODE_RATIO * num_nodes)))
+            num_func = min(num_func, num_nodes)
+            func_nodes = random.sample(list(nodes), num_func)
+
+            self.function_domains[domain_id] = func_nodes
+            self.function_nodes.update(func_nodes)
+
+        # 为功能节点生成按VNF类型区分的部署成本以及部署成本预算上限
+        for node in self.topology.nodes():
+            is_func = node in self.function_nodes
+            self.topology.nodes[node]['is_function_node'] = is_func
+            if is_func:
+                deploy_costs = {}
+                for vnf_type in VNF_TYPES:
+                    deploy_costs[vnf_type] = random.randint(1, MAX_DEPLOYMENT_COST)
+                self.topology.nodes[node]['deployment_costs'] = deploy_costs
+                # 部署成本预算上限（单个SFC内该节点可承受的部署成本总和）
+                budget = random.randint(MIN_DEPLOY_BUDGET, MAX_DEPLOY_BUDGET)
+                self.topology.nodes[node]['deploy_budget_capacity'] = budget
+            else:
+                # 非功能节点不携带部署成本和预算
+                self.topology.nodes[node]['deployment_costs'] = {}
+                self.topology.nodes[node]['deploy_budget_capacity'] = 0
+
     def _log_topology_summary(self):
         """在日志中记录当前拓扑和域划分概要"""
         if self.topology is None or not hasattr(self, 'log_file'):
@@ -261,9 +310,45 @@ class PVFPFramework:
                 self._append_log(
                     f"[拓扑] 域 {domain_id}: {len(nodes)} 个节点 {nodes}"
                 )
+                func_nodes = self.function_domains.get(domain_id, [])
+                self._append_log(
+                    f"[拓扑] 域 {domain_id}: 功能节点 {len(func_nodes)} 个 {func_nodes}"
+                )
         except Exception:
             # 拓扑日志失败不影响训练
             pass
+
+    def _print_topology_console(self):
+        """在控制台打印拓扑和NFV相关信息，便于对齐NFV模型结构"""
+        if self.topology is None:
+            return
+
+        print("\n[拓扑详情]" )
+        print(f"  scale={self.scale}, 节点数={self.topology.number_of_nodes()}, 链路数={self.topology.number_of_edges()}")
+
+        # 域划分与功能节点
+        for domain_id, nodes in self.domains.items():
+            func_nodes = self.function_domains.get(domain_id, [])
+            print(f"  域 {domain_id}: 节点 {nodes}")
+            print(f"    功能节点: {func_nodes}")
+
+        # 功能节点的部署预算与部署成本
+        print("\n[功能节点部署预算与部署成本]")
+        if hasattr(self, 'function_nodes'):
+            for node in sorted(self.function_nodes):
+                data = self.topology.nodes[node]
+                budget = data.get('deploy_budget_capacity', None)
+                deploy_costs = data.get('deployment_costs', {})
+                print(f"  节点 {node}: 预算={budget}, 部署成本={deploy_costs}")
+
+        # 链路属性：带宽、成本、时延
+        print("\n[链路属性]")
+        for u, v in self.topology.edges():
+            e = self.topology.edges[(u, v)]
+            bw = e.get('bandwidth', None)
+            cost = e.get('cost', None)
+            delay = e.get('delay', None)
+            print(f"  边 ({u}, {v}): 带宽={bw}, 成本={cost}, 时延={delay:.2f}ms")
     
     def run_federated_training(self, num_sfcs=10, aggregation_rounds=AGGREGATION_EPOCHS):
         """
@@ -427,9 +512,9 @@ class PVFPFramework:
                 'vnf_placements': None,
             }
 
-            # 为每个域创建环境并部署
+            # 为每个域创建环境并部署（仅在功能节点上尝试部署）
             for domain_id in range(self.num_domains):
-                domain_nodes = self.domains[domain_id]
+                domain_nodes = self.function_domains.get(domain_id, self.domains[domain_id])
                 
                 env = VNFPlacementEnv(
                     self.topology,
