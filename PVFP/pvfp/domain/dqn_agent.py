@@ -12,6 +12,10 @@ import sys
 sys.path.append('../..')
 from config import *
 
+# TensorFlow 2.x 兼容性处理
+if hasattr(tf, 'compat'):
+    tf = tf.compat.v1
+    tf.disable_eager_execution()
 
 class ReplayBuffer:
     """经验回放缓冲区"""
@@ -52,8 +56,9 @@ class ReplayBuffer:
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
         
-        return (np.array(states), np.array(actions), np.array(rewards),
-                np.array(next_states), np.array(dones))
+        # 这里返回原生Python列表，在DQNAgent.train中统一转换为NumPy数组，
+        # 便于对状态做展平和堆叠处理，避免形状不一致导致错误
+        return list(states), list(actions), list(rewards), list(next_states), list(dones)
     
     def size(self):
         """返回缓冲区当前大小"""
@@ -88,40 +93,36 @@ class DQNNetwork:
             self.state_input = tf.placeholder(tf.float32, [None, self.state_dim], name='state')
             
             # 第一层：600个神经元，ReLU激活
-            layer1 = tf.layers.dense(
-                inputs=self.state_input,
+            layer1 = tf.keras.layers.Dense(
                 units=DQN_NEURONS_PER_LAYER,
                 activation=tf.nn.relu,
-                kernel_initializer=tf.variance_scaling_initializer(),
+                kernel_initializer=tf.keras.initializers.VarianceScaling(),
                 name='layer1'
-            )
+            )(self.state_input)
             
             # 第二层：600个神经元，ReLU激活
-            layer2 = tf.layers.dense(
-                inputs=layer1,
+            layer2 = tf.keras.layers.Dense(
                 units=DQN_NEURONS_PER_LAYER,
                 activation=tf.nn.relu,
-                kernel_initializer=tf.variance_scaling_initializer(),
+                kernel_initializer=tf.keras.initializers.VarianceScaling(),
                 name='layer2'
-            )
+            )(layer1)
             
             # 第三层：600个神经元，ReLU激活
-            layer3 = tf.layers.dense(
-                inputs=layer2,
+            layer3 = tf.keras.layers.Dense(
                 units=DQN_NEURONS_PER_LAYER,
                 activation=tf.nn.relu,
-                kernel_initializer=tf.variance_scaling_initializer(),
+                kernel_initializer=tf.keras.initializers.VarianceScaling(),
                 name='layer3'
-            )
+            )(layer2)
             
             # 输出层：Q值
-            self.q_values = tf.layers.dense(
-                inputs=layer3,
+            self.q_values = tf.keras.layers.Dense(
                 units=self.action_dim,
                 activation=None,
-                kernel_initializer=tf.variance_scaling_initializer(),
+                kernel_initializer=tf.keras.initializers.VarianceScaling(),
                 name='q_values'
-            )
+            )(layer3)
             
             # 用于训练的占位符
             self.action = tf.placeholder(tf.int32, [None], name='action')
@@ -135,7 +136,7 @@ class DQNNetwork:
             self.loss = tf.reduce_mean(tf.square(self.target_q - q_value_selected))
             
             # 优化器：Adam
-            self.optimizer = tf.train.AdamOptimizer(learning_rate=self.learning_rate)
+            self.optimizer = tf.compat.v1.train.AdamOptimizer(learning_rate=self.learning_rate)
             self.train_op = self.optimizer.minimize(self.loss)
     
     def get_trainable_variables(self):
@@ -208,6 +209,17 @@ class DQNAgent:
         
         return update_ops
     
+    def _normalize_state(self, state):
+        """将环境状态转换为固定长度的一维向量"""
+        state_arr = np.asarray(state, dtype=np.float32).flatten()
+        if state_arr.size < self.state_dim:
+            padded = np.zeros(self.state_dim, dtype=np.float32)
+            padded[:state_arr.size] = state_arr
+            state_arr = padded
+        elif state_arr.size > self.state_dim:
+            state_arr = state_arr[:self.state_dim]
+        return state_arr
+    
     def _hard_update_target_network(self):
         """硬更新：完全复制预测网络到目标网络"""
         predict_vars = self.predict_net.get_trainable_variables()
@@ -236,9 +248,10 @@ class DQNAgent:
             return np.random.randint(0, self.action_dim)
         else:
             # 利用：选择Q值最大的动作
+            state_vec = self._normalize_state(state).reshape(1, -1)
             q_values = self.sess.run(
                 self.predict_net.q_values,
-                feed_dict={self.predict_net.state_input: state.reshape(1, -1)}
+                feed_dict={self.predict_net.state_input: state_vec}
             )
             return np.argmax(q_values[0])
     
@@ -259,10 +272,28 @@ class DQNAgent:
         # 检查缓冲区大小
         if self.replay_buffer.size() < MIN_REPLAY_SIZE:
             return 0.0
+            
+        # 确保不采样超过缓冲区大小
+        current_batch_size = min(batch_size, self.replay_buffer.size())
         
         # 采样
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(batch_size)
+        states, actions, rewards, next_states, dones = self.replay_buffer.sample(current_batch_size)
         
+        # 确保状态数据格式正确：逐个展平并堆叠成矩阵
+        try:
+            states = np.vstack([self._normalize_state(s).reshape(1, -1) for s in states])
+            next_states = np.vstack([self._normalize_state(s).reshape(1, -1) for s in next_states])
+        except Exception as e:
+            print(f"状态数据格式错误: {e}")
+            if len(states) > 0:
+                print(f"样本状态示例形状: {np.array(states[0]).shape}")
+            return 0.0
+
+        # 将动作、奖励和终止标记转换为NumPy数组
+        actions = np.asarray(actions, dtype=np.int32)
+        rewards = np.asarray(rewards, dtype=np.float32)
+        dones = np.asarray(dones, dtype=np.float32)
+
         # 计算目标Q值：Q_target = r + γ * max(Q_target(s', a'))
         next_q_values = self.sess.run(
             self.target_net.q_values,

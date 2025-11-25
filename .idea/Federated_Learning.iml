@@ -3,8 +3,10 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
+      <excludeFolder url="file://$MODULE_DIR$/pvfp_env" />
+      <excludeFolder url="file://$MODULE_DIR$/requirements" />
     </content>
-    <orderEntry type="jdk" jdkName="Python 3.12 (Federated_Learning)" jdkType="Python SDK" />
+    <orderEntry type="jdk" jdkName="Python 3.12 virtualenv at D:\.Workspace\.py\Federated_Learning\pvfp_env" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />
   </component>
 </module>

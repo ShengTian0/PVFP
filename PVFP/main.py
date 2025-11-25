@@ -110,6 +110,14 @@ class PVFPFramework:
             'aggregation_info': []
         }
         
+        os.makedirs(RESULT_SAVE_PATH, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_file = os.path.join(RESULT_SAVE_PATH, f"training_log_{timestamp}.txt")
+        with open(self.log_file, 'w', encoding='utf-8') as f:
+            f.write("PVFP 联邦训练日志\n")
+            f.write(f"scale={self.scale}, num_domains={self.num_domains}\n")
+            f.write("="*60 + "\n\n")
+
         print(f"\n{'='*70}")
         print(f"PVFP框架初始化完成!")
         print(f"{'='*70}\n")
@@ -201,6 +209,12 @@ class PVFPFramework:
                       f"Loss: {epoch_losses[-1]:.4f}, "
                       f"Avg Reward: {epoch_rewards[-1]:.2f}, "
                       f"Epsilon: {agent.epsilon:.4f}")
+                self._append_log(
+                    f"[域 {domain_id}] Epoch {epoch+1}/{epochs} - "
+                    f"Loss: {epoch_losses[-1]:.4f}, "
+                    f"Avg Reward: {epoch_rewards[-1]:.2f}, "
+                    f"Epsilon: {agent.epsilon:.4f}"
+                )
         
         training_stats = {
             'domain_id': domain_id,
@@ -211,6 +225,16 @@ class PVFPFramework:
         }
         
         return training_stats
+    
+    def _append_log(self, text):
+        """将文本追加写入训练日志文件"""
+        if not hasattr(self, 'log_file'):
+            return
+        try:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(text + "\n")
+        except Exception:
+            pass
     
     def run_federated_training(self, num_sfcs=10, aggregation_rounds=AGGREGATION_EPOCHS):
         """
@@ -275,6 +299,12 @@ class PVFPFramework:
                       f"用时: {train_end - train_start:.2f}s, "
                       f"平均Loss: {stats['avg_loss']:.4f}, "
                       f"平均Reward: {stats['avg_reward']:.2f}")
+                self._append_log(
+                    f"[域 {domain_id}] 训练完成 - "
+                    f"用时: {train_end - train_start:.2f}s, "
+                    f"平均Loss: {stats['avg_loss']:.4f}, "
+                    f"平均Reward: {stats['avg_reward']:.2f}"
+                )
             
             # 云端聚合
             if len(domain_weights_list) > 0:
@@ -300,6 +330,21 @@ class PVFPFramework:
                 print(f"\n[聚合完成] 轮次 {round_idx + 1} - "
                       f"平均Loss: {avg_loss:.4f}, "
                       f"平均Reward: {avg_reward:.2f}")
+                self._append_log(
+                    f"[聚合完成] 轮次 {round_idx + 1} - "
+                    f"平均Loss: {avg_loss:.4f}, "
+                    f"平均Reward: {avg_reward:.2f}"
+                )
+
+                agg_weights_str = ",".join(f"{w:.4f}" for w in agg_info.get('aggregation_weights', []))
+                staleness_str = ",".join(f"{s:.4f}" for s in agg_info.get('staleness_factors', []))
+                self._append_log(
+                    f"[聚合详情] 轮次 {agg_info.get('aggregation_round', round_idx + 1)} - "
+                    f"参与域数: {agg_info.get('num_domains', len(domain_weights_list))}, "
+                    f"avg_staleness: {agg_info.get('avg_staleness', 0):.4f}, "
+                    f"weights: [{agg_weights_str}], "
+                    f"staleness: [{staleness_str}]"
+                )
             
             # 重置拓扑资源
             self.topo_loader.reset_topology()
