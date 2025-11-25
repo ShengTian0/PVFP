@@ -57,7 +57,8 @@ MIN_REPLAY_SIZE = 64
 EPSILON_START = 1.0
 EPSILON_MIN = 0.01
 EPSILON_DECAY = 0.995
-USE_ADAPTIVE_EPSILON = True  # 使用基于奖励的自适应ε
+# 关闭基于奖励的自适应ε，使用标准指数衰减ε-greedy
+USE_ADAPTIVE_EPSILON = False
 
 # ==================== 联邦学习配置 ====================
 # 论文中默认将网络划分为3个联邦域
