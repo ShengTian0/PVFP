@@ -23,29 +23,29 @@ def check_python_version():
         return False
 
 def check_tensorflow():
-    """检查TensorFlow"""
+    """检查TensorFlow/DirectML"""
     print("\n" + "="*60)
-    print("检查TensorFlow...")
+    print("检查TensorFlow/DirectML...")
     print("="*60)
     
     try:
-        import tensorflow as tf
+        try:
+            import tensorflow as tf
+        except ImportError:
+            import tensorflow_directml as tf
         print(f"✓ TensorFlow版本: {tf.__version__}")
-        
-        # 检查GPU
-        gpu_available = tf.test.is_gpu_available()
-        if gpu_available:
-            print("✓ GPU可用")
+        gpus = tf.config.list_physical_devices('GPU')
+        if gpus:
+            print(f"✓ GPU可用: {gpus}")
         else:
             print("⚠ GPU不可用 (将使用CPU训练，速度较慢)")
-        
         return True
     except ImportError:
-        print("✗ TensorFlow未安装")
-        print("  请运行: pip install tensorflow-gpu==1.10.0")
+        print("✗ TensorFlow/DirectML未安装")
+        print("  Windows可安装: pip install tensorflow-directml")
         return False
     except Exception as e:
-        print(f"✗ TensorFlow检查失败: {e}")
+        print(f"✗ TensorFlow/DirectML检查失败: {e}")
         return False
 
 def check_numpy():

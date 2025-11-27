@@ -11,6 +11,7 @@ import time
 import json
 import random
 from datetime import datetime
+import networkx as nx
 
 # 添加路径
 sys.path.append('.')
@@ -494,39 +495,90 @@ class PVFPFramework:
         # 生成测试SFC
         test_sfcs = self.sfc_generator.generate_batch_sfcs(num_sfcs)
         
-        total_latency = 0
-        total_resource = 0
+        total_latency = 0.0
+        total_resource = 0.0
         success_count = 0
         per_sfc_results = []
         
         for sfc in test_sfcs:
+            sfc_id = sfc.get('id')
+            vnf_sequence = sfc.get('vnf_sequence', [])
+
             # 初始化当前SFC的评估结果容器
             sfc_result = {
-                'sfc_id': sfc.get('id'),
+                'sfc_id': sfc_id,
                 'source': sfc.get('source'),
                 'destination': sfc.get('destination'),
-                'vnf_sequence': sfc.get('vnf_sequence', []),
+                'vnf_sequence': vnf_sequence,
                 'success': False,
+                # 对于跨域部署，assigned_domain 将是使用到的域ID列表
                 'assigned_domain': None,
                 'metrics': None,
+                # 映射原始VNF索引 -> 部署节点
                 'vnf_placements': None,
+                # 记录每个域上的局部部署结果，便于调试
+                'domain_details': {},
             }
 
-            # 为每个域创建环境并部署（仅在功能节点上尝试部署）
-            for domain_id in range(self.num_domains):
+            # 云端按照当前拓扑状态对该SFC进行一次分段（与训练时一致）
+            segments_by_domain = self.decomposer.decompose_sfc(vnf_sequence, sfc_id)
+
+            # 记录每个域对应段在原始VNF序列中的起始索引，保证拼接顺序一致
+            domain_start_index = {}
+            start_idx = 0
+            for did in sorted(segments_by_domain.keys()):
+                seg = segments_by_domain[did]
+                seg_len = len(seg)
+                if seg_len > 0:
+                    domain_start_index[did] = start_idx
+                    start_idx += seg_len
+
+            # 如果所有域的段都是空的，则无法部署该SFC
+            if not domain_start_index:
+                per_sfc_results.append(sfc_result)
+                continue
+
+            # 聚合该SFC在所有相关域上的部署结果
+            sfc_success = True
+            used_domains = []
+            global_vnf_placements = {}
+
+            agg_total_latency = 0.0
+            agg_total_resource = 0.0
+            agg_cpu_cost = 0.0
+            agg_bw_cost = 0.0
+            agg_paths = []
+            agg_path_link_costs = []
+
+            for domain_id in sorted(domain_start_index.keys()):
+                segment = segments_by_domain.get(domain_id, [])
+                if not segment:
+                    continue
+
+                used_domains.append(domain_id)
                 domain_nodes = self.function_domains.get(domain_id, self.domains[domain_id])
-                
+
+                # 为该域上的SFC段构造局部请求（仅VNF序列不同，源宿暂沿用原SFC）
+                local_sfc_request = {
+                    'id': sfc_id,
+                    'source': sfc.get('source'),
+                    'destination': sfc.get('destination'),
+                    'vnf_sequence': segment,
+                    'bandwidth_requirement': sfc.get('bandwidth_requirement', 1.0),
+                    'cpu_requirement_per_vnf': sfc.get('cpu_requirement_per_vnf', VNF_CPU_REQUIREMENT),
+                }
+
                 env = VNFPlacementEnv(
                     self.topology,
-                    sfc,
+                    local_sfc_request,
                     self.parallel_rules,
                     domain_nodes
                 )
-                
+
                 state = env.reset()
                 done = False
                 agent = self.domain_agents[domain_id]
-                
+
                 while not done:
                     action = agent.select_action(
                         state,
@@ -535,27 +587,115 @@ class PVFPFramework:
                     )
                     next_state, reward, done, info = env.step(action)
                     state = next_state
-                
+
                 metrics = env.get_metrics()
 
-                # 记录该SFC在第一个成功部署域上的详细结果
-                if metrics['deployment_rate'] == 1.0:
-                    total_latency += metrics['total_latency']
-                    total_resource += metrics['total_resource_cost']
-                    success_count += 1
+                # 该域段未能完成全部VNF部署，则整条SFC视为失败
+                if metrics.get('deployment_rate', 0.0) < 1.0:
+                    sfc_success = False
 
-                    sfc_result['success'] = True
-                    sfc_result['assigned_domain'] = domain_id
-                    sfc_result['metrics'] = metrics
-                    # 复制一份部署映射，避免后续环境复用导致的副作用
-                    sfc_result['vnf_placements'] = dict(env.vnf_placements)
-                    break
+                # 将该域段的局部VNF索引映射回原始SFC的全局索引
+                start_index = domain_start_index[domain_id]
+                local_placements = dict(env.vnf_placements)
+                for local_idx, node in local_placements.items():
+                    global_idx = start_index + local_idx
+                    global_vnf_placements[global_idx] = node
+
+                # 聚合该域段的性能指标
+                agg_total_latency += metrics.get('total_latency', 0.0)
+                agg_total_resource += metrics.get('total_resource_cost', 0.0)
+                agg_cpu_cost += metrics.get('cpu_resource_cost', 0.0)
+                agg_bw_cost += metrics.get('bw_resource_cost', 0.0)
+
+                # 聚合路径和链路成本
+                paths = metrics.get('paths', []) or []
+                path_costs = metrics.get('path_link_costs', []) or []
+                agg_paths.extend(paths)
+                agg_path_link_costs.extend(path_costs)
+
+                # 记录该域的局部信息
+                sfc_result['domain_details'][domain_id] = {
+                    'segment': segment,
+                    'start_index': start_index,
+                    'metrics': metrics,
+                    'vnf_placements_local': local_placements,
+                }
+
+            # 为跨域段边界补充VNF间路径和链路成本（单域环境中未统计的跨域跳转）
+            if len(global_vnf_placements) == len(vnf_sequence) and domain_start_index:
+                bandwidth_req = sfc.get('bandwidth_requirement', 1.0)
+                # 按原始VNF序列中的起始索引对域排序，依次处理相邻域段的边界
+                ordered_domains = sorted(domain_start_index.items(), key=lambda x: x[1])
+                for idx in range(1, len(ordered_domains)):
+                    prev_did, prev_start = ordered_domains[idx - 1]
+                    curr_did, curr_start = ordered_domains[idx]
+                    prev_seg = segments_by_domain.get(prev_did, [])
+                    curr_seg = segments_by_domain.get(curr_did, [])
+                    if not prev_seg or not curr_seg:
+                        continue
+                    # 前一域段最后一个VNF与后一域段第一个VNF之间的跨域通信
+                    prev_last_global = prev_start + len(prev_seg) - 1
+                    curr_first_global = curr_start
+                    u = global_vnf_placements.get(prev_last_global)
+                    v = global_vnf_placements.get(curr_first_global)
+                    if u is None or v is None or u == v:
+                        continue
+                    try:
+                        path = nx.shortest_path(self.topology, u, v)
+                        path_delay = 0.0
+                        path_cost = 0.0
+                        for i in range(len(path) - 1):
+                            edge = (path[i], path[i+1])
+                            if self.topology.has_edge(*edge):
+                                edge_data = self.topology.edges[edge]
+                                # 链路时延
+                                path_delay += edge_data['delay']
+                                # 链路成本：ce * b
+                                link_cost = edge_data.get('cost', 1)
+                                edge_cost = link_cost * bandwidth_req
+                                path_cost += edge_cost
+                        # 传输延迟（与环境中一致）
+                        transmission_delay = BASE_TRANSMISSION_DELAY
+                        data_size = PACKET_SIZE + PACKET_HEADER  # bytes
+                        transfer_time = data_size * 8 * READ_WRITE_PER_BIT / 1000  # ms
+                        extra_latency = path_delay + transmission_delay + transfer_time
+                        agg_total_latency += extra_latency
+                        agg_bw_cost += path_cost
+                        agg_paths.append(path)
+                        agg_path_link_costs.append(path_cost)
+                    except nx.NetworkXNoPath:
+                        # 无路径时仅在延迟上给予惩罚
+                        agg_total_latency += 1000
+
+                # 总成本应等于部署成本与链路成本之和
+                agg_total_resource = agg_cpu_cost + agg_bw_cost
+
+            # 根据所有相关域的结果，确定该SFC的总体成功与否及聚合指标
+            if sfc_success and len(global_vnf_placements) == len(vnf_sequence):
+                sfc_result['success'] = True
+                sfc_result['assigned_domain'] = used_domains
+                sfc_result['vnf_placements'] = global_vnf_placements
+                sfc_result['metrics'] = {
+                    'total_latency': agg_total_latency,
+                    'avg_latency_per_vnf': agg_total_latency / len(vnf_sequence) if vnf_sequence else 0.0,
+                    'total_resource_cost': agg_total_resource,
+                    'cpu_resource_cost': agg_cpu_cost,
+                    'bw_resource_cost': agg_bw_cost,
+                    'num_vnfs_deployed': len(global_vnf_placements),
+                    'deployment_rate': len(global_vnf_placements) / len(vnf_sequence) if vnf_sequence else 0.0,
+                    'paths': agg_paths,
+                    'path_link_costs': agg_path_link_costs,
+                }
+
+                total_latency += agg_total_latency
+                total_resource += agg_total_resource
+                success_count += 1
 
             per_sfc_results.append(sfc_result)
 
-        avg_latency = total_latency / success_count if success_count > 0 else 0
-        avg_resource = total_resource / success_count if success_count > 0 else 0
-        success_rate = success_count / num_sfcs
+        avg_latency = total_latency / success_count if success_count > 0 else 0.0
+        avg_resource = total_resource / success_count if success_count > 0 else 0.0
+        success_rate = success_count / num_sfcs if num_sfcs > 0 else 0.0
         
         results = {
             'num_test_sfcs': num_sfcs,
@@ -653,12 +793,12 @@ def main():
     print("="*70)
     
     # 创建PVFP框架
-    pvfp = PVFPFramework(scale='small', num_domains=4)
+    pvfp = PVFPFramework(scale='small', num_domains=NUM_DOMAINS)
     
     # 执行联邦训练
     training_results = pvfp.run_federated_training(
         num_sfcs=10,
-        aggregation_rounds=20
+        aggregation_rounds=AGGREGATION_EPOCHS
     )
     
     # 评估模型

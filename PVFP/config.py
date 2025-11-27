@@ -64,7 +64,7 @@ USE_ADAPTIVE_EPSILON = False
 # 论文中默认将网络划分为3个联邦域
 NUM_DOMAINS = 3  # 域的数量
 AGGREGATION_EPOCHS = 100  # 全局聚合轮数
-LOCAL_EPOCHS = 10  # 每个域的本地训练轮数
+LOCAL_EPOCHS = 25  # 每个域的本地训练轮数（提高到接近论文收敛区间）
 
 # 时滞参数
 LAMBDA_STALENESS = 5  # 时滞衰减指数 λ
