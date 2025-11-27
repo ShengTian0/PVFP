@@ -33,7 +33,7 @@ ENV/
 *~
 
 # Logs and Results
-logs/
+PVFP/logs/
 *.log
 
 # Models
