@@ -61,3 +61,5 @@ checkpoint
 *.jpg
 *.pdf
 results/*.json
+
+logs/

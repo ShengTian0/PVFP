@@ -44,64 +44,86 @@ class TopologyLoader:
             topology: NetworkX图对象
         """
         num_nodes = self.config['nodes']
-        num_links = self.config['links']
         cpu_capacity = self.config['cpu_capacity']
         bandwidth = self.config['bandwidth']
-        
-        # 创建随机图（使用Erdős–Rényi模型确保连通性）
-        # 计算连接概率以达到目标链路数
-        p = (2 * num_links) / (num_nodes * (num_nodes - 1))
-        p = min(p, 1.0)
-        
-        # 生成图直到获得所需的链路数，且保持连通性
-        attempts = 0
-        max_attempts = 100
-        
-        while attempts < max_attempts:
-            G = nx.erdos_renyi_graph(num_nodes, p, seed=self.seed + attempts)
-            
-            # 要求基础图首先是连通的
-            if not nx.is_connected(G):
-                attempts += 1
-                continue
 
-            # 调整链路数
-            current_links = G.number_of_edges()
+        # 创建随机图（使用Erdős–Rényi模型确保连通性）
+        # small 规模：保持原有“按目标链路数反推 p” 的逻辑；
+        # large 规模：按照 Algorithm2 实验设置，使用 p=0.03 近似每对节点有 3% 概率连边，
+        #             不再强制精确链路数，只要求生成的图连通。
+        if self.scale == 'large':
+            p = 0.03
+            attempts = 0
+            max_attempts = 100
+
+            while attempts < max_attempts:
+                G = nx.erdos_renyi_graph(num_nodes, p, seed=self.seed + attempts)
+                if nx.is_connected(G):
+                    break
+                attempts += 1
+
+            if attempts >= max_attempts:
+                print(f"[警告] 无法生成连通拓扑，使用近似配置")
+                G = nx.erdos_renyi_graph(num_nodes, p, seed=self.seed)
+                if not nx.is_connected(G):
+                    # 退化为最大连通子图，保证后续环境不会因不连通而出错
+                    largest_cc = max(nx.connected_components(G), key=len)
+                    G = G.subgraph(largest_cc).copy()
+        else:
+            num_links = self.config['links']
+            # 计算连接概率以达到目标链路数
+            p = (2 * num_links) / (num_nodes * (num_nodes - 1))
+            p = min(p, 1.0)
             
-            if current_links > num_links:
-                # 删除多余的边，但尽量避免破坏连通性
-                edges = list(G.edges())
-                random.shuffle(edges)
-                for edge in edges:
-                    if G.number_of_edges() <= num_links:
-                        break
-                    G.remove_edge(*edge)
-                    if not nx.is_connected(G):
-                        # 删除该边会导致图不连通，撤销删除
-                        G.add_edge(*edge)
-            elif current_links < num_links:
-                # 添加边直到达到目标
-                all_possible_edges = [(i, j) for i in range(num_nodes) 
-                                     for j in range(i+1, num_nodes)]
-                existing_edges = set(G.edges())
-                possible_new_edges = [e for e in all_possible_edges 
-                                     if e not in existing_edges]
-                random.shuffle(possible_new_edges)
+            # 生成图直到获得所需的链路数，且保持连通性
+            attempts = 0
+            max_attempts = 100
+            
+            while attempts < max_attempts:
+                G = nx.erdos_renyi_graph(num_nodes, p, seed=self.seed + attempts)
                 
-                for edge in possible_new_edges:
-                    if G.number_of_edges() >= num_links:
-                        break
-                    G.add_edge(*edge)
+                # 要求基础图首先是连通的
+                if not nx.is_connected(G):
+                    attempts += 1
+                    continue
+
+                # 调整链路数
+                current_links = G.number_of_edges()
+                
+                if current_links > num_links:
+                    # 删除多余的边，但尽量避免破坏连通性
+                    edges = list(G.edges())
+                    random.shuffle(edges)
+                    for edge in edges:
+                        if G.number_of_edges() <= num_links:
+                            break
+                        G.remove_edge(*edge)
+                        if not nx.is_connected(G):
+                            # 删除该边会导致图不连通，撤销删除
+                            G.add_edge(*edge)
+                elif current_links < num_links:
+                    # 添加边直到达到目标
+                    all_possible_edges = [(i, j) for i in range(num_nodes) 
+                                         for j in range(i+1, num_nodes)]
+                    existing_edges = set(G.edges())
+                    possible_new_edges = [e for e in all_possible_edges 
+                                         if e not in existing_edges]
+                    random.shuffle(possible_new_edges)
+                    
+                    for edge in possible_new_edges:
+                        if G.number_of_edges() >= num_links:
+                            break
+                        G.add_edge(*edge)
+                
+                # 若当前图既连通又达到目标链路数，则结束
+                if nx.is_connected(G) and G.number_of_edges() == num_links:
+                    break
+                
+                attempts += 1
             
-            # 若当前图既连通又达到目标链路数，则结束
-            if nx.is_connected(G) and G.number_of_edges() == num_links:
-                break
-            
-            attempts += 1
-        
-        if attempts >= max_attempts:
-            print(f"[警告] 无法生成精确的拓扑，使用近似配置")
-            G = nx.erdos_renyi_graph(num_nodes, p, seed=self.seed)
+            if attempts >= max_attempts:
+                print(f"[警告] 无法生成精确的拓扑，使用近似配置")
+                G = nx.erdos_renyi_graph(num_nodes, p, seed=self.seed)
         
         # 为节点添加属性
         for node in G.nodes():
@@ -117,8 +139,13 @@ class TopologyLoader:
             G.edges[edge]['bandwidth_available'] = bandwidth
             # 随机延迟 (ms)
             G.edges[edge]['delay'] = random.uniform(1, 5)
-            # 传输成本（单位带宽的成本）
-            G.edges[edge]['cost'] = random.randint(1, MAX_LINK_COST)
+            # 传输成本（单位带宽的成本）：
+            #  - small 规模：保持随机 1..MAX_LINK_COST
+            #  - large  规模：统一为 3，以便与 Algorithm2 实验对齐
+            if self.scale == 'large':
+                G.edges[edge]['cost'] = 3
+            else:
+                G.edges[edge]['cost'] = random.randint(1, MAX_LINK_COST)
         
         self.topology = G
         
@@ -242,10 +269,21 @@ class SFCGenerator:
         nodes = list(self.topology.nodes())
         source = random.choice(nodes)
         destination = random.choice([n for n in nodes if n != source])
-        
-        # 随机生成VNF序列
-        sfc_length = random.randint(min_length, max_length)
-        vnf_sequence = [random.choice(VNF_TYPES) for _ in range(sfc_length)]
+
+        # 根据规模生成VNF序列
+        if len(nodes) >= 50:
+            # large 规模：SFC长度固定为4，从前4种服务中无重复抽取
+            sfc_length = 4
+            service_pool = VNF_TYPES[:4]
+            # 若可用服务类型少于4，则退化为随机选择
+            if len(service_pool) >= sfc_length:
+                vnf_sequence = random.sample(service_pool, k=sfc_length)
+            else:
+                vnf_sequence = [random.choice(VNF_TYPES) for _ in range(sfc_length)]
+        else:
+            # small 规模：保持原有随机长度和可重复服务的逻辑
+            sfc_length = random.randint(min_length, max_length)
+            vnf_sequence = [random.choice(VNF_TYPES) for _ in range(sfc_length)]
         
         # 随机带宽需求 (Mbps)
         bandwidth_requirement = random.uniform(0.5, 2.0)

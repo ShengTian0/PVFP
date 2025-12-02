@@ -221,23 +221,24 @@ class PVFPFramework:
                 
                 epoch_reward += episode_reward
             
-            # 更新epsilon
+            # 更新epsilon，并记录当前epoch的统计
             if num_steps > 0:
                 avg_reward = epoch_reward / len(sfc_segments)
                 agent.update_epsilon(avg_reward)
                 
-                epoch_losses.append(epoch_loss / num_steps)
+                epoch_loss_avg = epoch_loss / num_steps
+                epoch_losses.append(epoch_loss_avg)
                 epoch_rewards.append(avg_reward)
-            
-            if (epoch + 1) % LOG_INTERVAL == 0:
+
+                # 打印每个epoch的loss，便于观察收敛过程
                 print(f"  Epoch {epoch+1}/{epochs} - "
-                      f"Loss: {epoch_losses[-1]:.4f}, "
-                      f"Avg Reward: {epoch_rewards[-1]:.2f}, "
+                      f"Loss: {epoch_loss_avg:.4f}, "
+                      f"Avg Reward: {avg_reward:.2f}, "
                       f"Epsilon: {agent.epsilon:.4f}")
                 self._append_log(
                     f"[域 {domain_id}] Epoch {epoch+1}/{epochs} - "
-                    f"Loss: {epoch_losses[-1]:.4f}, "
-                    f"Avg Reward: {epoch_rewards[-1]:.2f}, "
+                    f"Loss: {epoch_loss_avg:.4f}, "
+                    f"Avg Reward: {avg_reward:.2f}, "
                     f"Epsilon: {agent.epsilon:.4f}"
                 )
         
@@ -265,20 +266,55 @@ class PVFPFramework:
         """在每个域内选取功能节点，并为其生成部署成本矩阵"""
         self.function_nodes = set()
         self.function_domains = {}
+        # small 规模：沿用按比例选取功能节点的策略
+        if self.scale == 'small':
+            for domain_id, nodes in self.domains.items():
+                num_nodes = len(nodes)
+                if num_nodes == 0:
+                    self.function_domains[domain_id] = []
+                    continue
 
-        for domain_id, nodes in self.domains.items():
-            num_nodes = len(nodes)
-            if num_nodes == 0:
-                self.function_domains[domain_id] = []
-                continue
+                # 按比例选取功能节点，至少1个
+                num_func = max(1, int(round(FUNCTION_NODE_RATIO * num_nodes)))
+                num_func = min(num_func, num_nodes)
+                func_nodes = random.sample(list(nodes), num_func)
 
-            # 按比例选取功能节点，至少1个
-            num_func = max(1, int(round(FUNCTION_NODE_RATIO * num_nodes)))
-            num_func = min(num_func, num_nodes)
-            func_nodes = random.sample(list(nodes), num_func)
+                self.function_domains[domain_id] = func_nodes
+                self.function_nodes.update(func_nodes)
+        else:
+            # large 规模：全局功能节点总数固定为 5 个，参考 Algorithm2 配置
+            all_nodes = list(self.topology.nodes())
+            selected_funcs = set()
+            domain_funcs = {}
 
-            self.function_domains[domain_id] = func_nodes
-            self.function_nodes.update(func_nodes)
+            # 1) 先在每个域中各选 1 个候选功能节点，保证每域至少有 1 个
+            for domain_id, nodes in self.domains.items():
+                domain_nodes = list(nodes)
+                if not domain_nodes:
+                    domain_funcs[domain_id] = []
+                    continue
+
+                cand = random.choice(domain_nodes)
+                selected_funcs.add(cand)
+                domain_funcs.setdefault(domain_id, []).append(cand)
+
+            # 2) 若当前全局功能节点数不足 5，则从剩余节点中补足
+            remaining = [n for n in all_nodes if n not in selected_funcs]
+            need_extra = max(0, 5 - len(selected_funcs))
+            if need_extra > 0 and remaining:
+                extra_nodes = random.sample(remaining, min(need_extra, len(remaining)))
+                for n in extra_nodes:
+                    selected_funcs.add(n)
+                    # 找到该节点所属的域并加入对应列表
+                    for domain_id, nodes in self.domains.items():
+                        if n in nodes:
+                            domain_funcs.setdefault(domain_id, []).append(n)
+                            break
+
+            self.function_nodes = selected_funcs
+            # 为每个域记录其功能节点列表
+            for domain_id in self.domains.keys():
+                self.function_domains[domain_id] = domain_funcs.get(domain_id, [])
 
         # 为功能节点生成按VNF类型区分的部署成本以及部署成本预算上限
         for node in self.topology.nodes():
@@ -287,7 +323,12 @@ class PVFPFramework:
             if is_func:
                 deploy_costs = {}
                 for vnf_type in VNF_TYPES:
-                    deploy_costs[vnf_type] = random.randint(1, MAX_DEPLOYMENT_COST)
+                    # 为便于与 Algorithm2 对齐，大规模网络下部署成本最大值为 10，
+                    # 小规模保持原有 MAX_DEPLOYMENT_COST 范围。
+                    if self.scale == 'large':
+                        deploy_costs[vnf_type] = random.randint(1, 10)
+                    else:
+                        deploy_costs[vnf_type] = random.randint(1, MAX_DEPLOYMENT_COST)
                 self.topology.nodes[node]['deployment_costs'] = deploy_costs
                 # 部署成本预算上限（单个SFC内该节点可承受的部署成本总和）
                 budget = random.randint(MIN_DEPLOY_BUDGET, MAX_DEPLOY_BUDGET)
@@ -409,6 +450,22 @@ class PVFPFramework:
                 domain_timestamps_list.append(train_end)
                 
                 round_stats.append(stats)
+
+                # 将该域本轮的每个epoch loss追加写入文件，便于后续画loss曲线
+                losses = stats.get('losses', [])
+                if losses:
+                    loss_file = os.path.join(
+                        RESULT_SAVE_PATH,
+                        f"loss_curve_{self.scale}_domain{domain_id}.txt"
+                    )
+                    try:
+                        with open(loss_file, 'a', encoding='utf-8') as f_loss:
+                            for epoch_idx, loss_val in enumerate(losses, start=1):
+                                f_loss.write(
+                                    f"round={round_idx+1}, epoch={epoch_idx}, loss={loss_val:.6f}\n"
+                                )
+                    except Exception:
+                        pass
                 
                 print(f"\n[域 {domain_id}] 训练完成 - "
                       f"用时: {train_end - train_start:.2f}s, "

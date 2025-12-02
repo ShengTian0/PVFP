@@ -14,8 +14,10 @@ SMALL_SCALE = {
 }
 
 # 大规模网络配置
+# 注意：对于 large 规模，我们在 TopologyLoader 中使用 Erdős–Rényi 随机图，
+# 节点数固定为 50，边连接概率在生成函数中单独指定（参考 Algorithm2 实验配置）。
 LARGE_SCALE = {
-    'nodes': 35,
+    'nodes': 50,
     'links': 79,
     'cpu_capacity': 20,
     'bandwidth': 2,
@@ -36,6 +38,9 @@ VNF_MEMORY_REQUIREMENT = 512  # MB
 # ==================== SFC配置 ====================
 MAX_SFC_LENGTH = 10  # SFC最大长度
 MIN_SFC_LENGTH = 3   # SFC最小长度
+LARGE_SFC_LENGTH = 4  # large规模下SFC固定长度
+LARGE_PARALLEL_NUM = 3  # large规模下并行功能数
+LARGE_PARALLEL_POSITION = 1  # large规模下并行功能起始位置(与算法2配置对应, 1表示第一个功能)
 
 # ==================== DQN超参数 ====================
 # 网络结构
@@ -64,7 +69,7 @@ USE_ADAPTIVE_EPSILON = False
 # 论文中默认将网络划分为3个联邦域
 NUM_DOMAINS = 3  # 域的数量
 AGGREGATION_EPOCHS = 100  # 全局聚合轮数
-LOCAL_EPOCHS = 25  # 每个域的本地训练轮数（提高到接近论文收敛区间）
+LOCAL_EPOCHS = 10  # 每个域的本地训练轮数（已根据loss收敛速度下调）
 
 # 时滞参数
 LAMBDA_STALENESS = 5  # 时滞衰减指数 λ
@@ -88,10 +93,17 @@ RESULT_SAVE_PATH = './logs/results/'
 
 # ==================== 网络模型配置 ====================
 FUNCTION_NODE_RATIO = 0.4
-MAX_DEPLOYMENT_COST = 20
+MAX_DEPLOYMENT_COST = 10
 MAX_LINK_COST = 10
-MIN_DEPLOY_BUDGET = 40
-MAX_DEPLOY_BUDGET = 80
+MIN_DEPLOY_BUDGET = 20
+MAX_DEPLOY_BUDGET = 20
+
+# 大规模网络下的部署成本与链路成本配置（参考 Algorithm2 实验）
+MAX_LARGE_DEPLOYMENT_COST = 10
+LARGE_USE_FIXED_DEPLOY_COST = False
+LARGE_FIXED_DEPLOY_COST = 5
+LARGE_USE_FIXED_LINK_COST = False
+LARGE_FIXED_LINK_COST = 3
 
 # ==================== GPU配置 ====================
 USE_GPU = True

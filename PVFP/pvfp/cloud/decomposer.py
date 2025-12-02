@@ -119,6 +119,19 @@ class SFCDecomposer:
                 key=lambda d: domain_resources[d]['available_cpu']
             )
             domain_allocations[max_cpu_domain] += remaining_vnfs
+
+        # 进一步平衡：如果SFC长度足够长，则尽量保证每个域至少分配到1个VNF，
+        # 避免某些域（如日志中的域1）长期为0段而无法参与训练。
+        if sfc_length >= len(domain_allocations):
+            zero_domains = [d for d, n in domain_allocations.items() if n == 0]
+            for d in zero_domains:
+                # 从当前分配最多且数量>1的域借出一个VNF
+                donor_candidates = [k for k, n in domain_allocations.items() if n > 1]
+                if not donor_candidates:
+                    break
+                donor = max(donor_candidates, key=lambda k: domain_allocations[k])
+                domain_allocations[donor] -= 1
+                domain_allocations[d] += 1
         
         # 根据分配数量切分SFC
         sfc_segments = {}
